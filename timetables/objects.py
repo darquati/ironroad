@@ -660,7 +660,7 @@ class TimetableNR:
         
         # Add call sequence
         if 'CallSeq' in tt.index.names:
-            self.schedules = self.schedules.droplevel('CallSeq')
+            tt.schedules = tt.schedules.droplevel('CallSeq')
         tt['CallSeq'] = callflag.groupby(level='ScheduleID').cumsum().astype(int)
         tt.set_index('CallSeq', append=True, inplace=True)
         tt.index = tt.index.swaplevel('EventSeq','CallSeq')
@@ -1446,7 +1446,7 @@ class TimetableNR:
         return od_line_daily
 
     def trains_calling_at(self, location):
-        schedules_at = self.schedules[self.schedules.LocationID==location].index.get_level_values('ScheduleID').unique()
+        schedules_at = self.schedules[(self.schedules.LocationID==location) & self.schedules.Flags.str.match('SC.')].index.get_level_values('ScheduleID').unique()
         patterns_at = self.patterns.reindex(schedules_at).join(self.lines['Line'], on='RouteID')
         return patterns_at
 
