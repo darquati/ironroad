@@ -198,6 +198,7 @@ class NRDefinitions:
                            'Tiplocs': l_tiplocs,
                            'Tiplocs-Nodes': l_tiplocs_nodes,
                            'Locations': l_location_flags,
+                           'NBTStations': l_scope,
                            'Coordinates': l_coords,
                            'NR-ASC': l_nr_asc,
                            'LineRemapping': line_remapping,
@@ -235,13 +236,13 @@ class TimetableNR:
                      [[140000,650000],[0,1030000]])}
 
     def __init__(self, databundle, 
-                       scope_field,
-                       reprocess=False,
+                       scope_field='NBT2020',
                        datewindow=None,
                        filters={'Train Status':   ['P','1'],
                                 'Train Category': ['OO','XX']},
-                       continue_beyond_load=True,
-                       load_until_state=6,
+                       reprocess=False, # Start at state 0 (load from CIF) or highest available
+                       continue_beyond_load=True, # Continue processing
+                       load_until_state=6, # ...until
                        prior_probabilities='2020',
                        verbose=False,
                        save=True):
@@ -301,7 +302,7 @@ class TimetableNR:
         else:
             self.load_cif_db(datewindow=datewindow, filters=filters) # Load from the CIF extract
             
-        if (continue_beyond_load or reprocess):
+        if ((continue_beyond_load and not processed) or reprocess):
             if self.state < 2:
                 print(f"Processing from CIF...")           
                 self.set_scope()            # results in state 1 (finds trips_by_date, trips_by_weekday)
@@ -513,14 +514,9 @@ class TimetableNR:
     def set_scope(self):
         """
         Determines which trains operate on which dates
-        - By date: Working (Permanent) and Planned timetables
+        - By date: Working (Permanent) and Planned timetables [0: Planned, 1: Overlay, 2: Actual]
         - By weekday: Working (Permanent) only for dates of interest
         
-        #  A. Summary stats for each Schedule(UID+STP) which get added to the CIF summary table (output_uids_summary)
-        #  B. List of trains operating on each day of the week (perm - output_uids_perm_byweekday), each date (perm - output_uids_perm_bydate), each date (planned - output_uids_planned_bydate)
-        #  C. 'Complete' CSV of the permanent schedule by weekday incl all relevant summary data (output_timetable_permbyday)
-        #  D. CSV of all the Schedules, for use as reference data with the CIF summary table if looking for specific dates (output_timetable_allbyuid)
-        # The various CIF tables allow us to get A, B and C through merges with the tt
         """
         
         indicators = {'C':3,'N':2,'O':1,'P':0}
@@ -1376,9 +1372,11 @@ class TimetableNR:
                 self.trips_bydate.reset_index().to_sql('trips_bydate', **kwargs)
                 self.trips_byweekday.reset_index().to_sql('trips_byweekday', **kwargs)
             if 4 in increments:               
+                self.schedules.reset_index().to_sql('schedules', **kwargs) # because CallSeq was added at 3.1
                 self.patterns.drop('Pattern', axis=1).reset_index().to_sql('patterns', **kwargs)
                 self.routes.explode('Pattern').reset_index().to_sql('routes', **kwargs)
             if 5 in increments:
+                self.schedules.reset_index().to_sql('schedules', **kwargs)
                 self.lines.reset_index().to_sql('lines', **kwargs)
             if 6 in increments:
                 self.summary.reset_index().to_sql('summary', **kwargs)
