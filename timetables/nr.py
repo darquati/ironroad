@@ -41,7 +41,7 @@ def get_local_file(ttdate=None, extract=False):
         searchdate = '*'
 
     if extract:
-        file_location = Path(cfg.cfg['paths']['nr_downloaded_file'].format(databundle=searchdate))
+        file_location = Path(cfg.cfg['paths']['nr_downloaded_file'].format(date=searchdate))
         processstr='downloaded'
     else:
         file_location = Path(cfg.cfg['paths']['nr_extracted_file'].format(databundle=searchdate))

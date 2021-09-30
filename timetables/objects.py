@@ -25,6 +25,7 @@ from matplotlib import pyplot as plt
 from ..locations.naptan import load_naptan
 from ..tools import (Timer, compass_direction, compass_to_cardinal,
                    pythag_distance)
+from ..timetables import nr
 from .. import cfg
 
 #%%
@@ -143,8 +144,8 @@ class Timetable:
 class NRDefinitions:
     def __init__(self, definitions_file=cfg.cfg['paths']['ref_nr_definitions_file'], 
                            stations_file=cfg.cfg['paths']['ref_stations_file'], 
-                           scope_field='NBT2019'):
-        print(f"Loading definitions from {definitions_file}")
+                           scope_field='NBT2021'):
+        print(f"Loading NR definitions from {definitions_file}")
         # Get list of location codes
         with pd.ExcelFile(definitions_file) as definitions:
             l_tiplocs = pd.read_excel(definitions, 'Locations', index_col='TIPLOC')\
@@ -158,22 +159,27 @@ class NRDefinitions:
             l_tiplocs_nodes = pd.read_excel(definitions, 'Locations', index_col='TIPLOC')
         
         # Get London area of scope and our internal PTSP ASC codes
-        print(f"Loading definitions from {stations_file} based on {scope_field} scope")
+        print(f"Loading PTSP definitions from {stations_file} based on {scope_field} scope")
         with pd.ExcelFile(stations_file) as stations:
-            l_scope = pd.read_excel(stations, 'List', index_col='Master ASC')
+            l_scope = pd.read_excel(stations, 'ASC-NBTScope', index_col='MasterASC')
             l_scope = l_scope[l_scope[scope_field]]
             l_nr_asc = pd.read_excel(stations, 'NR-ASC', index_col='NR_TIPLOC', 
-                                     usecols=['NR_TIPLOC','NR_CRS','TfL_mASC'])
+                                     usecols=['NR_TIPLOC','NR_CRS','MasterASC'])
             l_nr_asc.index.name='TIPLOC'
+            l_scope = pd.read_excel(stations, 'Stations', index_col='MasterASC').reindex(l_scope.index)
+            l_altnames = pd.read_excel(stations, 'AltNames-ASC', index_col='Name')
+            l_modes = pd.read_excel(stations, 'ASC-Mode', index_col='MasterASC').drop(['UniqueStationName','Active'], axis=1)
+            l_lineseq = pd.read_excel(stations, 'ASC-LineSeq', index_col='MasterStnSeq')
+            l_servseq = pd.read_excel(stations, 'ASC-ServiceSeq', index_col='MasterStnSeq')
         
         # Remove duplicates from directions, prioritising non-bus (Line==Bus.all or Line!=Bus)
-        all_links_bus = (l_directions_l['line']=='BUS').groupby(level=['origin','destination']).transform('all')
-        link_not_bus = (l_directions_l['line']!='BUS')
-        l_directions_l = l_directions_l.loc[all_links_bus | link_not_bus, ['direction_initial','direction_final','Distance']].sort_values('Distance')
-        l_directions_l = l_directions_l[~l_directions_l.index.duplicated()].sort_index()
+        all_links_bus   = (l_directions_l['line']=='BUS').groupby(level=['origin','destination']).transform('all')
+        link_not_bus    = (l_directions_l['line']!='BUS')
+        l_directions_l  = l_directions_l.loc[all_links_bus | link_not_bus, ['direction_initial','direction_final','Distance']].sort_values('Distance')
+        l_directions_l  = l_directions_l[~l_directions_l.index.duplicated()].sort_index()
 
-        l_directions = l_directions_l[['direction_initial','direction_final']]
-        l_distances = l_directions_l['Distance']
+        l_directions    = l_directions_l[['direction_initial','direction_final']]
+        l_distances     = l_directions_l['Distance']
         
         network = nx.MultiDiGraph()
         nx.from_pandas_edgelist(l_directions_l.replace({'U':1,'D':-1}).reset_index(), 
@@ -182,26 +188,31 @@ class NRDefinitions:
                                 create_using=network)
         
         
-        l_tiplocs = l_tiplocs.join(l_nr_asc['TfL_mASC'])
+        l_tiplocs       = l_tiplocs.join(l_nr_asc['MasterASC'])
         l_tiplocs[['stationflag','londonflag','lonterminalflag']] = l_tiplocs[['stationflag','londonflag','lonterminalflag']].fillna(0).astype(bool)
         
-        l_coords = l_tiplocs[['easting','northing']].dropna()
-        l_location_flags = l_tiplocs[['stationflag','londonflag']]
-        l_terminals = l_tiplocs[l_tiplocs['lonterminalflag']].index.unique()
+        l_coords            = l_tiplocs[['easting','northing']].dropna()
+        l_location_flags    = l_tiplocs[['stationflag','londonflag']]
+        l_terminals         = l_tiplocs[l_tiplocs['lonterminalflag']].index.unique()
         
-        check_nr_numbat = l_scope[l_scope['NR']=='NR'].index.isin(l_nr_asc['TfL_mASC']).all()
-        print(f"Are all NUMBAT NR stations in the TIPLOC-MASC lookup?: {check_nr_numbat}")
-        
+        nr_numbat           = l_scope.join(l_modes[l_modes['r']]['r'], how='inner')
+        missing_nr_numbat   = ~nr_numbat.index.isin(l_nr_asc['MasterASC'])
+        print(f"Are any NUMBAT NR stations missing from the Power Reference NR-ASC lookup?: {missing_nr_numbat.any()}")
+        if missing_nr_numbat.any(): print(f"Missing: {', '.join(nr_numbat[missing_nr_numbat].index.tolist())}")
         
         self.lookups = {   'Directions': l_directions,
                            'Distances': l_distances,
                            'Tiplocs': l_tiplocs,
                            'Tiplocs-Nodes': l_tiplocs_nodes,
                            'Locations': l_location_flags,
+                           'Modes': l_modes,
                            'NBTStations': l_scope,
                            'Coordinates': l_coords,
                            'NR-ASC': l_nr_asc,
+                           'AltNames': l_altnames,
                            'LineRemapping': line_remapping,
+                           'LineSeq': l_lineseq,
+                           'ServSeq': l_servseq,
                            'Terminals': l_terminals,
                            'Network': network}
     def __getitem__(self, key):
@@ -240,15 +251,26 @@ class TimetableNR:
                        datewindow=None,
                        filters={'Train Status':   ['P','1'],
                                 'Train Category': ['OO','XX']},
-                       reprocess=False, # Start at state 0 (load from CIF) or highest available
-                       continue_beyond_load=True, # Continue processing
-                       load_until_state=6, # ...until
+                       #reprocess=False, # Start at state 0 (load from CIF) or highest available
+                       load_until_state=6, # Load existing data where available no further than this state (0:start from CIF, 6:max)
+                       process_until_state=6, # Continue processing after load, no further than this state (6:max)
                        prior_probabilities='2020',
                        verbose=False,
                        save=True):
         
         print("Establishing TimetableNR object...")
         self.state = -1
+        """
+        States
+        -1: CIF file
+        0: CIF database
+        1: Scoped
+        2: Cleaned
+        3: Enriched
+        4: Patterned
+        5: Lined
+        6: Summarised
+        """
         
         self.databundle = databundle
         
@@ -264,7 +286,8 @@ class TimetableNR:
         self.input_db  = Path(cfg.cfg['paths']['nr_extracted_file'].format(databundle=databundle))
         self.output_db = Path(cfg.cfg['paths']['nr_processed_file'].format(databundle=databundle))
 
-        processed = self.output_db.exists()
+        input_exists = self.input_db.exists()
+        output_exists = self.output_db.exists()
         
         output_file_template = output_folder/'{name}_{d}.csv'.format(name='{name}', d=databundle)
         
@@ -291,42 +314,52 @@ class TimetableNR:
         
         self.output_file_locations = {key: Path(str(output_file_template).format(name=value)) for key, value in self.output_file_names.items()}
         
-        self.logs = {}
-        self.lookups = NRDefinitions(scope_field=scope_field)
+        self.logs       = {}
+        self.lookups    = NRDefinitions(scope_field=scope_field)
         
-        if processed and not reprocess:
+        if output_exists and (load_until_state > 0):
             self.reload(load_until_state) # Load from the already-processed database
             self.state = min((self.state, load_until_state))
             print(f"Achieved with state {self.state}")
             
+        elif input_exists:
+            self.load_cif_db(datewindow=datewindow, filters=filters) # Load from the CIF extract
+            self.set_state(0)
         else:
+            _  = nr.get_timetable(ttdate=databundle, source='local')
             self.load_cif_db(datewindow=datewindow, filters=filters) # Load from the CIF extract
             
-        if ((continue_beyond_load and not processed) or reprocess):
-            if self.state < 2:
-                print(f"Processing from CIF...")           
+        if (process_until_state > self.state):
+            if (self.state < 1) and (process_until_state >= 1):
+                print(f"[Process] Processing from CIF...")           
                 self.set_scope()            # results in state 1 (finds trips_by_date, trips_by_weekday)
-                self.clean_timetable()      # results in state 2 (recasts self.schedules into PTSP format)
-                if save: self.save_db()
+                if save: self.save_db(increment=[1])
 
-            if self.state < 4:
-                print(f"Enriching with location & geometry data...")
-                self.identify_locations()   # results in state 3.1
-                self.add_distance()         # results in state 3.2
-                self.add_geometry()         # results in state 3.3
-                self.add_directions()       # results in state 3.3
-                self.gather_patterns()
-                self.set_state(4.2)
+            if (self.state < 2) and (process_until_state >= 2):
+                self.clean_timetable()      # results in state 2 (recasts self.schedules into PTSP format)
+                if save: self.save_db(increment=[2])
+
+            if (self.state < 3) and (process_until_state >= 3):
+                print(f"[Process] Enriching with location & geometry data...")
+                self.identify_locations()   # results in state 2.1
+                self.add_distance()         # results in state 2.2
+                self.add_geometry()         # results in state 2.3
+                self.add_directions()       # results in state 3
+                if save: self.save_db(increment=[3])
+
+            if (self.state < 4) and (process_until_state >= 4):
+                print(f"[Process] Gathering calling patterns...")
+                self.patterns, self.routes = self.gather_patterns(self.schedules, self.trips_bydate) #
+                self.set_state(4)
                 if save: self.save_db(increment=[4])
 
-            if self.state < 5:
-                print(f"Identifying lines...")   
+            if (self.state < 5) and (process_until_state >= 5):
+                print(f"[Process] Identifying lines...")   
                 in_probabilities_file = cfg.cfg['paths']['ref_nr_line_probabilities_file'].format(dprior=prior_probabilities)                
                 try:
                     self.lines = self.identify_lines(self.routes, in_probabilities_file)
-                    self.set_state(4.3)              
-                    self.lines = self.remap_lines()
-                    self.set_state(5)               
+                    self.lines = self.remap_lines(self.lines)
+                    self.set_state(5)
                     self.validate_lines(plot_all=verbose)                
                     if save: 
                         self.save_db(increment=[5])
@@ -334,8 +367,8 @@ class TimetableNR:
                 except Exception as err:
                     print(err)
 
-            if self.state < 6:
-                print(f"Summarizing...")
+            if (self.state < 6) and (process_until_state >= 6):
+                print(f"[Process] Summarizing...")
                 try:
                     self.create_summary()
                     #self.create_link_summary()
@@ -344,6 +377,7 @@ class TimetableNR:
                     if save: self.save_db(increment=[6])
                 except Exception as err:
                     print(err)
+
 
     def __repr__(self):
         return f'TimetableNR(databundle={self.databundle},\ndatewindow={self.datewindow},\nstate={self.state})'
@@ -359,14 +393,12 @@ class TimetableNR:
         if input_db is None: input_db = self.input_db
         zd = {}
         print(f"Loading from CIF extract at {self.input_db}")
-        con = sqlite3.connect(self.input_db)
-        #con = create_engine(r"sqlite:///{}".format(input_cif_database))
-        
-        for table in ['BS', 'BX', 'LO', 'LI', 'LT']:
-            print("Reading {}...".format(table))
-            zd[table] = pd.read_sql("SELECT * FROM {table}".format(table=table), con)
-        
-        con.close()
+        with sqlite3.connect(self.input_db) as con:
+            #con = create_engine(r"sqlite:///{}".format(input_cif_database))
+            
+            for table in ['BS', 'BX', 'LO', 'LI', 'LT']:
+                print("Reading {}...".format(table))
+                zd[table] = pd.read_sql("SELECT * FROM {table}".format(table=table), con)
             
         # 2. Set up the overview of trains
         # Add the basic schedule (overview of trains) into single dataframe
@@ -469,19 +501,13 @@ class TimetableNR:
             else:
                 logger.info(f"State: {self.state}")
                 
-            if self.state >= 2:
+            if self.state >= 1:
                 logger.info("Fetching trips, schedules, trips_bydate and trips_byweekday")
                 self.trips           = pd.read_sql('SELECT * FROM trips', index_col='ScheduleID', **kwargs)
-                self.schedules       = pd.read_sql('SELECT * FROM schedules', **kwargs).set_index(['ScheduleID','CallSeq','EventSeq'])
                 self.trips_bydate    = pd.read_sql('SELECT * FROM trips_bydate', parse_dates='Date', **kwargs).set_index(['TrainUID','Day','Date'])
                 self.trips_byweekday = pd.read_sql('SELECT * FROM trips_byweekday', **kwargs).set_index(['TrainUID','Day'])
-            
+                self.schedules       = pd.read_sql('SELECT * FROM schedules', **kwargs).set_index(['ScheduleID','CallSeq','EventSeq'])
                 self.trips_bydate.columns = self.trips_bydate.columns.astype(int)
-                
-                #for c in ['TrainUID','Activity','LocationID','Platform','EventType',
-                #      'DirectionLink','DirectionRun','Line',
-                #      'LocationNext','LocationPrev','CallNext','CallPrev']:
-                #self.schedules[c] = pd.Categorical(self.schedules[c])
                 
             if self.state >= 4:
                 logger.info("Fetching patterns and routes")
@@ -642,7 +668,7 @@ class TimetableNR:
         
         tt = self.schedules
     
-        tt['Flags'] = self.identify_pax_calls()
+        tt['Flags'] = self.produce_flags()
 
         callflag = tt['Flags'].str.match('.[Cud].')
         
@@ -656,13 +682,13 @@ class TimetableNR:
         
         # Add call sequence
         if 'CallSeq' in tt.index.names:
-            tt.schedules = tt.schedules.droplevel('CallSeq')
+            tt = tt.droplevel('CallSeq')
         tt['CallSeq'] = callflag.groupby(level='ScheduleID').cumsum().astype(int)
         tt.set_index('CallSeq', append=True, inplace=True)
         tt.index = tt.index.swaplevel('EventSeq','CallSeq')
         
         self.schedules = tt
-        self.set_state(3.1)
+        self.set_state(2.1)
         
         t.stop()
         
@@ -671,17 +697,17 @@ class TimetableNR:
         
         t = Timer("Adding distances...")
         
-        if self.state < 3.1:
+        if self.state < 2.1:
             raise ValueError("Cannot add distances before locations have been added (state 3.1 required)")
         
         self.schedules = self.schedules.join(self.lookups['Distances'], on=['LocationID','LocationNext'], how='left')
-        self.set_state(3.2)
+        self.set_state(2.2)
                                
         t = t.stop()
 
     def add_geometry(self):
                
-        if self.state < 3.2:
+        if self.state < 2.2:
             raise ValueError("Cannot add distances before distances have been added (state 3.2 required)")
         
         tt = self.schedules
@@ -740,7 +766,7 @@ class TimetableNR:
         tt['DirectionCompass'] = tt['DirectionCompass'].mask(tt['EventType']=='LT')
         
         self.schedules = tt
-        self.set_state(3.3) # Geometries have been added
+        self.set_state(2.3) # Geometries have been added
 
     def identify_pax_calls(self):
 
@@ -757,6 +783,10 @@ class TimetableNR:
                               .fillna('').sum(axis=1)\
                               .replace({'T':'C','':'-','R':'C','U':'u','D':'d'})
         
+        return calls
+
+    def validate_calls(self, calls=None):
+        if calls is None: calls = self.identify_pax_calls()
         call_counts = self.schedules.groupby([self.schedules['LocationID'], calls]).size()\
                                  .unstack()\
                                  .dropna(subset=['C','d','u'], how='all')
@@ -770,7 +800,6 @@ class TimetableNR:
         calls_not_in_list = locations_not_in_list.query("C>1")
         
         print("These 'Calls' don't look like NR stations:\n{}.".format(calls_not_stations.sort_values('C',0,False)))
-        self.calls_not_stations = calls_not_stations
         
         if len(calls_not_in_list) > 0:
             print("""Please update the location lookup table (below) with these new 
@@ -779,7 +808,14 @@ class TimetableNR:
             raise(ValueError("Not all TIPLOCs can be identified"))
         else:
             print("All call locations available in lookup table")
+            
+        return calls_not_stations
+        
            
+    def produce_flags(self):
+        calls = self.identify_pax_calls()
+        self.calls_not_stations = self.validate_calls(calls)
+        
         flags = (  self.schedules['LocationID'].map(self.lookups['Locations']['stationflag']).fillna(False).map({True:'S',False:'-'}) 
                  + calls 
                  + self.schedules['LocationID'].map(self.lookups['Locations']['londonflag']).fillna(False).map({True:'L',False:'-'})
@@ -864,10 +900,10 @@ class TimetableNR:
         """Adds directions to the data through a multistage process"""
         if 'DirectionLink' in self.schedules.columns:
             self.schedules = self.schedules.drop('DirectionLink', axis=1)
-            self.set_state(3.3)
+            self.set_state(2.3)
         
-        if self.state < 3.3:
-            raise ValueError("Cannot add directions before locations & geometry (State 3.3 required)")
+        if self.state < 2.3:
+            raise ValueError("Cannot add directions before locations & geometry (State 2.3 required)")
         
         ttd = self.schedules[['EventType','Flags','LocationID','LocationNext','LocationPrev','CallNext','CallPrev']].copy()
         
@@ -972,28 +1008,30 @@ class TimetableNR:
                                 .fillna(ttd['DirectionRun']).fillna('')
         
         self.schedules[['DirectionLink','DirectionRun']] = ttd[['DirectionLink','DirectionRun']]
-        self.set_state(4)
+        self.set_state(3)
         t.stop()
     
-    def gather_patterns(self):
-        calls   = self.schedules['Flags'].str.match('.[Cud].')
-        weights = self.trips_bydate[2]\
+    def gather_patterns(self, schedules, trips_bydate):
+        calls   = schedules['Flags'].str.match('.[Cud].')
+        weights = trips_bydate[2]\
                       .value_counts()\
                       .drop(-1, errors='ignore')\
                       .rename('Weight')
-        self.patterns = self.schedules[calls]\
+        patterns = schedules[calls]\
                             .join(weights, on='ScheduleID')\
                             .groupby('ScheduleID')\
                             .agg(Pattern=('LocationID', tuple), 
                                  Weight=('Weight','sum'),
                                  Direction=('DirectionRun', 'first'))
 
-        self.patterns['RouteID'] = self.patterns['Pattern'].apply(hash)
+        patterns['RouteID'] = patterns['Pattern'].apply(hash)
     
-        self.routes = self.patterns\
-                          .groupby(['RouteID','Pattern','Direction'])['Weight'].sum()\
-                          .reset_index(['Pattern','Direction'])
-
+        routes = patterns.groupby(['RouteID','Pattern','Direction'])['Weight'].sum()\
+                         .reset_index(['Pattern','Direction'])
+                         
+        return patterns, routes
+        #self.set_state(4) (Don't set this here as it will get re-done later after summarising)
+        
     def identify_lines(self, routes, prior_probabilities_file, certainty_thresh=.9, zero_replacement=0.00001):
         
         """
@@ -1080,7 +1118,7 @@ class TimetableNR:
         
         return tt_lineprob
         
-    def remap_lines(self):
+    def remap_lines(self, lines):
         
         print("Forcibly remapping lines where specified in Definitions table...")
         remapping = self.lookups['LineRemapping'][::-1]\
@@ -1093,18 +1131,18 @@ class TimetableNR:
             patterns_toforce = self.routes[['Pattern']].explode('Pattern')\
                                    .query("Pattern=='{stn}'".format(stn=stn))\
                                    .index.unique()
-            self.lines.loc[patterns_toforce, 'Line'] = self.lines.loc[patterns_toforce, 'Line']\
+            lines.loc[patterns_toforce, 'Line'] = lines.loc[patterns_toforce, 'Line']\
                                                            .replace(linefrom, lineto)
-            self.lines.loc[patterns_toforce, 'LineScore'] = np.nan
+            lines.loc[patterns_toforce, 'LineScore'] = np.nan
         
         # Test results in London
         sch_with_london = self.schedules['Flags'].str.match('S[Cud]L')\
                               .groupby(level='ScheduleID').any()
         pat_with_london = self.patterns.loc[sch_with_london, 'RouteID'].unique()
-        london_lines =  self.lines.reindex(pat_with_london)['Line'].value_counts()
-        print("Test results for services calling in Oyster area:\n{}".format(london_lines))
+        london_lines    =  lines.reindex(pat_with_london)['Line'].value_counts()
+        print(f"Test results for services calling in Oyster area:\n{london_lines}")
         
-        return self.lines
+        return lines
 
     def validate_lines(self, plot_all=False):
         
@@ -1168,7 +1206,7 @@ class TimetableNR:
 
     def create_summary(self):
         tt = self.schedules
-        if self.state >= 4:
+        if self.state >= 5:
             line_s = self.patterns.join(self.lines['Line'], on='RouteID')[['RouteID','Line']]
             run_summary = tt.groupby('ScheduleID').agg({
                                     'Distance':'sum',
@@ -1202,7 +1240,7 @@ class TimetableNR:
             run_summary['DirectionRun']     = run_summary['DirectionRun'].replace('',np.nan).mask(run_summary['CircularService']).fillna(run_summary['CircularDirection'])
             
             self.schedules['DirectionRun'] = self.schedules[['LocationID']].join(run_summary['DirectionRun'])['DirectionRun']
-            self.gather_patterns() # Re-do the patterns as the Direction will have changed for some trips
+            self.patterns, self.routes = self.gather_patterns(self.schedules, self.trips_bydate) # Re-do the patterns as the Direction will have changed for some trips
 
             if self.state >= 5:
                 run_summary[['RouteID','Line']] = line_s
@@ -1217,7 +1255,7 @@ class TimetableNR:
             print("Insufficient state to create a summary. State is {} and should be 4 or more".format(self.state))
         
         self.summary = run_summary
-        self.set_state(6)
+        #self.set_state(6)
         return self.summary
 
     def create_link_summary(self, save=False):
@@ -1294,10 +1332,10 @@ class TimetableNR:
         
     def save_logs(self):
         # Output event count
-        #self.logs['eventcounts'].to_csv(self.output_file_locations['eventcounts'])
+        if hasattr(self, 'logs'):
+            if 'eventcounts' in self.logs:
+                self.logs['eventcounts'].to_csv(self.output_file_locations['eventcounts'])
         
-        self.calls_not_stations.to_csv(self.output_file_locations['badcalls_file'])
-
         # Output line probabilities
         self.schedules[self.schedules['Flags'].str.match('S[Cud].')]\
             .join(self.patterns['RouteID'], on='ScheduleID')\
@@ -1307,7 +1345,13 @@ class TimetableNR:
             .unstack([1])\
             .apply(lambda x: x / x.sum(), axis=1)\
             .to_csv(self.output_file_locations['output_line_probabilities_file'], index=True)
-        self.lines.to_csv(self.output_file_locations['output_line_identification_results'])
+
+        if not hasattr(self, 'calls_not_stations'):
+            self.calls_not_stations = self.validate_calls()
+        self.calls_not_stations.to_csv(self.output_file_locations['badcalls_file'])
+
+        if hasattr(self, 'lines'):
+            self.lines.to_csv(self.output_file_locations['output_line_identification_results'])
 
         if hasattr(self, 'badmatching_locations'):
             self.badmatching_locations.to_csv(self.output_file_locations['classification_log'], header=True)
@@ -1360,25 +1404,31 @@ class TimetableNR:
             else:
                 increments = increment
         else:
-            increments = [x for x in [2,4,5,6] if self.state >= x]
+            increments = [x for x in [1,4,5,6] if self.state >= x]
         
         with sqlite3.connect(output_db) as conn:
             kwargs = {'con': conn, 'if_exists': 'replace', 'index': False}
             pd.Series(self.state).to_sql('state', **kwargs)
             
-            if 2 in increments:
-                self.trips.reset_index().to_sql('trips', **kwargs)
+            if any([y in increments for y in [1,2,3,5]]):
+                print("Saving schedules [1-5]")
+                # resave schedules in all cases except 4 and 6
                 self.schedules.reset_index().to_sql('schedules', **kwargs)
+                
+            if 1 in increments:
+                print("Saving trips [1]")
+                self.trips.reset_index().to_sql('trips', **kwargs)
                 self.trips_bydate.reset_index().to_sql('trips_bydate', **kwargs)
                 self.trips_byweekday.reset_index().to_sql('trips_byweekday', **kwargs)
             if 4 in increments:               
-                self.schedules.reset_index().to_sql('schedules', **kwargs) # because CallSeq was added at 3.1
+                print("Saving patterns [4]")
                 self.patterns.drop('Pattern', axis=1).reset_index().to_sql('patterns', **kwargs)
                 self.routes.explode('Pattern').reset_index().to_sql('routes', **kwargs)
             if 5 in increments:
-                self.schedules.reset_index().to_sql('schedules', **kwargs)
+                print("Saving lines [5]")
                 self.lines.reset_index().to_sql('lines', **kwargs)
             if 6 in increments:
+                print("Saving summary [6]")
                 self.summary.reset_index().to_sql('summary', **kwargs)
                 try:
                     if hasattr(self, 'operator_volume_stats'):
@@ -1399,7 +1449,7 @@ class TimetableNR:
     # Convenience functions for extracting portions of the data
     def full_tt(self):
         line_s = self.patterns.join(self.lines, on='RouteID')['Line']
-        all_trips = self.trips_byweekday.to_frame().join(line_s, on='ScheduleID')
+        all_trips = self.trips_byweekday.join(line_s, on='ScheduleID')
         tt_perm = all_trips.join(self.schedules\
                                      .reset_index(['CallSeq','EventSeq']), 
                                                   on='ScheduleID')\
@@ -1552,17 +1602,17 @@ class TimetableTfL:
         # JourneyPatternTimingLinks: link JourneyPatternSections to Links and run times (to nearest minute)
         # VehicleJourneys: links JourneyCodes to Service, LineRef, JourneyPatternRef and has DepartureTime
 
-        con = sqlite3.connect(self.input_db)
-        cur = con.cursor()
-        get_tables = cur.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
-        get_tables = pd.Series(get_tables).explode().unique()
-
-        tx = {key: [] for key in get_tables}
-        for table in get_tables:
-            logger.info(f"Reading {table}")
-            q = pd.read_sql_query(f"SELECT * FROM '{table}' WHERE Mode IN {str(tuple(modes))}", con).drop('index', axis=1)
-            tx[table].append(q)
-        con.close()
+        with sqlite3.connect(self.input_db) as con:
+            cur = con.cursor()
+            get_tables = cur.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
+            get_tables = pd.Series(get_tables).explode().unique()
+    
+            tx = {key: [] for key in get_tables}
+            for table in get_tables:
+                logger.info(f"Reading {table}")
+                q = pd.read_sql_query(f"SELECT * FROM '{table}' WHERE Mode IN {str(tuple(modes))}", con).drop('index', axis=1)
+                tx[table].append(q)
+            
         
         for t, ldf in tx.items():
             tx[t] = pd.concat(ldf)
